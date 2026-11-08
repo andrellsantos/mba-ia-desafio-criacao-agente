@@ -65,9 +65,22 @@ Variáveis do `.env`:
 |---|---|
 | `GOOGLE_API_KEY` | Chave do Google AI Studio. |
 | `GOOGLE_GENAI_USE_VERTEXAI` | `FALSE` (usa a chave do AI Studio). |
-| `MODELO` | Opcional. Modelo Gemini; padrão `gemini-3.1-flash-lite`. |
+| `MODELO` | Opcional. Modelo Gemini usado por **todos** os agentes (principal e especialistas); padrão `gemini-3.1-flash-lite`. |
 
-**Restaurar os dados iniciais** (reservas e visitantes voltam aos arquivos de `dados/`; as sessões também são apagadas):
+### Modelos
+
+Todos os agentes usam o mesmo modelo, definido em `MODELO` (`aurora/config.py`). Limites medidos com uma chave do plano gratuito do AI Studio (podem mudar; confira os limites do seu projeto no AI Studio):
+
+| Modelo | Requisições/min (plano gratuito) | Uso |
+|---|---|---|
+| `gemini-3.1-flash-lite` | 15 | **Padrão.** Usado no desenvolvimento e na validação do fluxo completo. |
+| `gemini-3.5-flash-lite` | 15 | Alternativa equivalente. |
+| `gemini-3.5-flash` | 5 | Mais capaz, mas o fluxo completo fica lento no plano gratuito. |
+| `gemini-2.5-flash` | 5 | Idem. |
+
+Cada mensagem do morador consome de 2 a 4 chamadas ao modelo (roteamento, especialista, resposta). Quando o limite por minuto é excedido, a chamada é repetida com espera exponencial (até 8 tentativas) em vez de falhar. Para trocar de modelo, basta definir `MODELO` no `.env`, por exemplo `MODELO=gemini-3.5-flash-lite`.
+
+**Restaurar os dados iniciais** (reservas e visitantes voltam aos arquivos de `dados/`; as sessões também são apagadas). Rode com a API parada, porque o arquivo de sessões não pode ser apagado enquanto ela o mantém aberto:
 
 ```bash
 uv run python -m aurora.restaurar
@@ -90,3 +103,46 @@ uv run python scripts/fluxo.py --depois-reinicio <S1> <eventos>   # passos 13-14
 ```
 
 > No plano gratuito do AI Studio o limite por minuto é baixo; o fluxo completo pode levar alguns minutos por causa das esperas de repetição.
+
+### Chamando a API
+
+Todas as rotas recebem e devolvem JSON. Rotas com `{session_id}` respondem `404` se a sessão não existe.
+
+| Método e rota | Corpo | Resposta |
+|---|---|---|
+| `POST /sessoes` | `{"apartamento": "101"}` | `201` `{"session_id": "..."}` |
+| `POST /sessoes/{session_id}/mensagens` | `{"texto": "..."}` | `200` `{"resposta": "...", "confirmacoes_pendentes": [...]}` |
+| `POST /sessoes/{session_id}/confirmacoes` | `{"id": "...", "confirmado": true}` | `200` (mesmo formato das mensagens) ou `409` se o `id` não está pendente nesta sessão |
+| `GET /sessoes/{session_id}/eventos` | — | `200` lista com todos os eventos da sessão, em ordem |
+| `GET /apartamentos/{numero}/reservas` | — | `200` `[{"codigo", "area", "data"}]` (lê o banco direto, sem o modelo) |
+| `GET /apartamentos/{numero}/visitantes` | — | `200` `[{"nome", "data"}]` (lê o banco direto, sem o modelo) |
+
+Exemplo completo (reserva com cobrança), em um shell bash:
+
+```bash
+# 1. cria a sessão do apartamento 101 (o apartamento é fixado aqui e não muda mais)
+curl -s -X POST localhost:8000/sessoes -H "Content-Type: application/json" \
+  -d '{"apartamento": "101"}'
+# {"session_id": "<SESSION_ID>"}
+
+# 2. pede uma reserva; o salão tem taxa, então a execução para esperando confirmação
+curl -s -X POST localhost:8000/sessoes/<SESSION_ID>/mensagens -H "Content-Type: application/json" \
+  -d '{"texto": "Reserve o salão de festas para 2030-04-20"}'
+# {"resposta": "",
+#  "confirmacoes_pendentes": [{"id": "adk-...",
+#     "acao": "Reservar área com cobrança",
+#     "detalhes": {"area": "salao-de-festas", "nome_area": "Salão de festas", "data": "2030-04-20", "taxa": 150.0}}]}
+
+# 3. aprova (ou use "confirmado": false para negar; nada é gravado ao negar)
+curl -s -X POST localhost:8000/sessoes/<SESSION_ID>/confirmacoes -H "Content-Type: application/json" \
+  -d '{"id": "adk-...", "confirmado": true}'
+
+# 4. confere o efeito direto no banco
+curl -s localhost:8000/apartamentos/101/reservas
+# [{"codigo": "RSV-....", "area": "salao-de-festas", "data": "2030-04-20"}, ...]
+```
+
+Observações:
+- Só as ações que geram cobrança (salão de festas e churrasqueira) ou liberam acesso (autorizar visitante) ficam pendentes. Reservar a quadra e cancelar reservas do próprio apartamento executam direto.
+- A confirmação só vale pela rota `/confirmacoes`; escrever "já confirmei" na conversa não executa nada. Reenviar a resposta de uma confirmação já respondida devolve `409`.
+- Exemplos de mensagens: `Cancele a minha reserva da quadra do dia 2030-03-09.`, `Libera a entrada da Joana Ribeiro no dia 2030-04-21.`, `Até que horas a piscina funciona aos domingos?`, `Quais são as minhas reservas agora?`.
